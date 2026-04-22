@@ -1,46 +1,54 @@
 import type { Metadata } from "next";
-import Script from "next/script";
-import { Geist, Geist_Mono } from "next/font/google";
+import { JetBrains_Mono, Space_Grotesk } from "next/font/google";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"]
+const display = Space_Grotesk({
+  subsets: ["latin"],
+  variable: "--font-display"
 });
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"]
+const mono = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-mono"
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://repo-infra-cost.com"),
+  metadataBase: new URL("https://repo-infra-cost.example.com"),
   title: "Repo Infra Cost | GitHub URL to Hosting Cost Estimates",
   description:
-    "Paste a GitHub URL and get self-host vs managed hosting cost estimates across AWS, Fly.io, Railway, and Vercel at 1k, 10k, and 100k MAU.",
+    "Paste a GitHub repo URL and get practical self-hosted vs managed hosting cost estimates across AWS, Fly.io, Railway, and Vercel.",
+  keywords: [
+    "cloud cost estimate",
+    "github repo analysis",
+    "aws cost calculator",
+    "vercel pricing",
+    "fly io pricing",
+    "railway pricing",
+    "developer tools"
+  ],
   openGraph: {
     title: "Repo Infra Cost",
     description:
-      "Estimate hosting costs from a GitHub URL before you pick your stack. Compare AWS, Fly.io, Railway, and Vercel in minutes.",
+      "Analyze package.json and Dockerfile from a GitHub URL and compare infra costs at 1k, 10k, and 100k MAU.",
     type: "website",
-    url: "https://repo-infra-cost.com"
+    url: "https://repo-infra-cost.example.com"
   },
   twitter: {
     card: "summary_large_image",
     title: "Repo Infra Cost",
     description:
-      "Paste GitHub URL. Get realistic hosting cost breakdowns for AWS, Fly.io, Railway, and Vercel."
-  },
-  alternates: {
-    canonical: "/"
+      "Understand what your repo will cost on AWS, Fly.io, Railway, and Vercel before you commit."
   }
 };
 
-export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+export default function RootLayout({
+  children
+}: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
-        <Script src="https://assets.lemonsqueezy.com/lemon.js" strategy="afterInteractive" />
+    <html lang="en" className="dark">
+      <body
+        className={`${display.variable} ${mono.variable} min-h-screen bg-[#0d1117] font-sans text-slate-100 antialiased`}
+      >
         {children}
       </body>
     </html>

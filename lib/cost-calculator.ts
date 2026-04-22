@@ -1,232 +1,269 @@
-import type {
-  CostEstimationReport,
-  PlatformEstimate,
-  RepoAnalysis,
-  ResourcePlan,
-  ScaleCostBreakdown,
-  TrafficScale
-} from "@/types";
+import type { PlatformCost, RepoAnalysis, ScaleCostBreakdown } from "@/types";
 
-interface CostInput {
-  analysis: RepoAnalysis;
-  averageRequestsPerUser?: number;
-  averageResponseKb?: number;
+const HOURS_PER_MONTH = 730;
+const SECONDS_PER_MONTH = 30 * 24 * 60 * 60;
+const MAU_SCALES: Array<ScaleCostBreakdown["mau"]> = [1000, 10000, 100000];
+
+function roundUsd(value: number) {
+  return Number(value.toFixed(2));
 }
 
-const SCALE_TARGETS: Array<{ key: "1k" | "10k" | "100k"; mau: number }> = [
-  { key: "1k", mau: 1_000 },
-  { key: "10k", mau: 10_000 },
-  { key: "100k", mau: 100_000 }
-];
+function estimateDemand(analysis: RepoAnalysis, mau: number) {
+  const monthlyRequests = mau * analysis.trafficProfile.requestsPerUserPerMonth;
+  const avgRps = monthlyRequests / SECONDS_PER_MONTH;
+  const peakRps = avgRps * 8;
 
-function round2(input: number) {
-  return Math.round(input * 100) / 100;
-}
+  const baseCpu = analysis.resourceEstimate.baselineCpuCores;
+  const cpuFromTraffic = peakRps * (analysis.trafficProfile.averageCpuMsPerRequest / 1000) * 1.35;
+  const requiredCpu = Math.max(baseCpu, cpuFromTraffic + baseCpu * 0.4);
 
-function buildTrafficScale(mau: number, key: "1k" | "10k" | "100k", requestsPerUser: number, avgResponseKb: number): TrafficScale {
-  const monthlyRequests = Math.max(1, Math.round(mau * requestsPerUser));
-  const averageRps = monthlyRequests / (30 * 24 * 3600);
-  const peakRps = Math.max(0.1, averageRps * 14);
+  const baseMemoryGb = analysis.resourceEstimate.baselineMemoryMb / 1024;
+  const memoryFromTraffic = Math.min(8, peakRps * 0.025);
+  const requiredMemoryGb = Math.max(
+    baseMemoryGb,
+    baseMemoryGb + memoryFromTraffic + (analysis.resourceEstimate.hasBackgroundWorkers ? 0.35 : 0)
+  );
+
+  const outboundGb =
+    (monthlyRequests * analysis.trafficProfile.averageResponseKb) / 1024 / 1024 * 1.18;
 
   return {
-    key,
-    mau,
     monthlyRequests,
-    averageResponseKb: avgResponseKb,
-    peakRps: round2(peakRps)
+    requiredCpu,
+    requiredMemoryGb,
+    outboundGb
   };
 }
 
-function buildResourcePlan(analysis: RepoAnalysis, scale: TrafficScale): ResourcePlan {
-  const complexityFactor = analysis.heuristics.complexity === "high" ? 1.35 : analysis.heuristics.complexity === "medium" ? 1.15 : 1;
-  const throughputPerVcpu = analysis.runtime.framework === "Next.js" ? 35 : 45;
-
-  const baselineCpu = analysis.heuristics.cpuBaseline;
-  const requiredCpuForPeak = (scale.peakRps / throughputPerVcpu) * complexityFactor;
-  const totalVcpu = Math.max(baselineCpu, requiredCpuForPeak);
-
-  const memoryGbBase = Math.max(0.5, analysis.heuristics.memoryMb / 1024);
-  const memoryForScale = memoryGbBase * Math.max(1, Math.log10(scale.mau));
-  const totalMemoryGb = Math.max(memoryGbBase, memoryForScale);
-
-  const appInstances = Math.max(1, Math.ceil(scale.peakRps / 4));
-  const vcpuPerInstance = round2(Math.max(0.25, totalVcpu / appInstances));
-  const memoryGbPerInstance = round2(Math.max(0.5, totalMemoryGb / appInstances));
-
-  const bandwidthGb = round2((scale.monthlyRequests * scale.averageResponseKb) / (1024 * 1024));
-  const buildMinutes = Math.ceil(analysis.heuristics.buildMinutes * Math.max(1, Math.log10(scale.mau)));
-
-  return {
-    appInstances,
-    vcpuPerInstance,
-    memoryGbPerInstance,
-    totalVcpu: round2(appInstances * vcpuPerInstance),
-    totalMemoryGb: round2(appInstances * memoryGbPerInstance),
-    bandwidthGb,
-    buildMinutes
-  };
-}
-
-function estimateAws(plan: ResourcePlan, scale: TrafficScale, dbNeeded: boolean): PlatformEstimate {
-  const vcpuHourPrice = 0.04048;
-  const gbHourPrice = 0.004445;
-
-  const compute = plan.totalVcpu * 730 * vcpuHourPrice + plan.totalMemoryGb * 730 * gbHourPrice;
+function awsCost(analysis: RepoAnalysis, mau: number, demand: ReturnType<typeof estimateDemand>): PlatformCost {
+  const computeCost =
+    demand.requiredCpu * HOURS_PER_MONTH * 0.04048 +
+    demand.requiredMemoryGb * HOURS_PER_MONTH * 0.004445;
   const loadBalancer = 18;
-  const storage = Math.max(4, plan.totalMemoryGb) * 0.115;
-  const db = dbNeeded ? (scale.mau >= 100_000 ? 160 : scale.mau >= 10_000 ? 55 : 18) : 0;
-  const bandwidth = Math.max(0, scale.mau >= 10_000 ? plan.bandwidthGb - 100 : plan.bandwidthGb) * 0.09;
-  const ops = 12;
+  const logsAndMonitoring = 8 + demand.monthlyRequests / 1_000_000;
 
-  const monthlyCost = round2(compute + loadBalancer + storage + db + bandwidth + ops);
+  const dbCost = analysis.resourceEstimate.hasPersistentDatabase
+    ? Math.max(18, 15 + mau * 0.0012)
+    : Math.max(12, 10 + mau * 0.0004);
+
+  const bandwidth = Math.max(0, demand.outboundGb - 100) * 0.09;
+  const opsOverhead = 0.18 * (computeCost + dbCost + loadBalancer);
+  const total = computeCost + loadBalancer + logsAndMonitoring + dbCost + bandwidth + opsOverhead;
 
   return {
     platform: "AWS",
-    monthlyCost,
+    confidence: "medium",
+    totalUsd: roundUsd(total),
     lineItems: [
-      { name: "ECS/Fargate Compute", monthlyCost: round2(compute) },
-      { name: "Load Balancer", monthlyCost: loadBalancer },
-      { name: "Block Storage", monthlyCost: round2(storage) },
-      { name: "Managed Database", monthlyCost: db },
-      { name: "Data Transfer", monthlyCost: round2(bandwidth) },
-      { name: "Operational Buffer", monthlyCost: ops }
+      {
+        label: "Compute (ECS/Fargate equivalent)",
+        amountUsd: roundUsd(computeCost),
+        detail: `${demand.requiredCpu.toFixed(2)} vCPU + ${demand.requiredMemoryGb.toFixed(2)} GB RAM across 730h`
+      },
+      {
+        label: "Managed database",
+        amountUsd: roundUsd(dbCost),
+        detail: analysis.resourceEstimate.hasPersistentDatabase
+          ? "Assumes db.t4g.micro-class baseline with incremental IO"
+          : "Assumes lightweight persistence for sessions and job state"
+      },
+      {
+        label: "Load balancer + observability",
+        amountUsd: roundUsd(loadBalancer + logsAndMonitoring),
+        detail: "ALB baseline plus CloudWatch/metrics"
+      },
+      {
+        label: "Bandwidth",
+        amountUsd: roundUsd(bandwidth),
+        detail: `${demand.outboundGb.toFixed(1)} GB outbound after free tier`
+      },
+      {
+        label: "Ops overhead",
+        amountUsd: roundUsd(opsOverhead),
+        detail: "Time cost for patching, deployments, and incident handling"
+      }
     ],
     assumptions: [
-      "Uses on-demand Fargate-style pricing for containerized web workloads.",
-      "Includes managed DB baseline only when database dependencies were detected."
+      "Single-region deployment",
+      "No CDN offload beyond basic caching",
+      "Uses managed services but includes self-hosting operational overhead"
     ]
   };
 }
 
-function estimateFly(plan: ResourcePlan, scale: TrafficScale, dbNeeded: boolean): PlatformEstimate {
-  const cpuHour = 0.034;
-  const memoryHour = 0.0052;
-
-  const compute = plan.totalVcpu * 730 * cpuHour + plan.totalMemoryGb * 730 * memoryHour;
-  const volumes = Math.max(1, Math.ceil(plan.totalMemoryGb)) * 0.15;
-  const db = dbNeeded ? (scale.mau >= 100_000 ? 70 : scale.mau >= 10_000 ? 26 : 10) : 0;
-  const egress = plan.bandwidthGb * 0.02;
-
-  const monthlyCost = round2(compute + volumes + db + egress);
+function flyCost(analysis: RepoAnalysis, mau: number, demand: ReturnType<typeof estimateDemand>): PlatformCost {
+  const appCompute = demand.requiredCpu * 14 + demand.requiredMemoryGb * 4.8;
+  const workerCompute = analysis.resourceEstimate.hasBackgroundWorkers ? 8 + demand.requiredCpu * 3.2 : 0;
+  const volume = Math.max(analysis.resourceEstimate.storageGb, 3) * 0.15;
+  const dbCost = analysis.resourceEstimate.hasPersistentDatabase
+    ? Math.max(20, 16 + mau * 0.0011)
+    : 0;
+  const bandwidth = Math.max(0, demand.outboundGb - 100) * 0.02;
+  const total = appCompute + workerCompute + volume + dbCost + bandwidth;
 
   return {
     platform: "Fly.io",
-    monthlyCost,
+    confidence: "medium",
+    totalUsd: roundUsd(total),
     lineItems: [
-      { name: "Machine Runtime", monthlyCost: round2(compute) },
-      { name: "Volumes", monthlyCost: round2(volumes) },
-      { name: "Managed Postgres", monthlyCost: db },
-      { name: "Network Egress", monthlyCost: round2(egress) }
+      {
+        label: "App VMs",
+        amountUsd: roundUsd(appCompute),
+        detail: "shared-cpu style VM footprint based on inferred runtime demand"
+      },
+      {
+        label: "Background worker",
+        amountUsd: roundUsd(workerCompute),
+        detail: analysis.resourceEstimate.hasBackgroundWorkers
+          ? "Extra worker process for queues/cron"
+          : "No worker tier assumed"
+      },
+      {
+        label: "Volumes + database",
+        amountUsd: roundUsd(volume + dbCost),
+        detail: analysis.resourceEstimate.hasPersistentDatabase
+          ? "Persistent volume and managed Postgres"
+          : "Persistent volume only"
+      },
+      {
+        label: "Bandwidth",
+        amountUsd: roundUsd(bandwidth),
+        detail: `${demand.outboundGb.toFixed(1)} GB outbound`
+      }
     ],
     assumptions: [
-      "Assumes regional deployment with always-on machines.",
-      "Excludes enterprise support and private networking add-ons."
+      "Region pinned close to primary users",
+      "Managed Postgres only when DB deps are detected",
+      "No private networking surcharge"
     ]
   };
 }
 
-function estimateRailway(plan: ResourcePlan, scale: TrafficScale, dbNeeded: boolean): PlatformEstimate {
-  const cpuHour = 0.03;
-  const memoryHour = 0.0035;
-
-  const compute = plan.totalVcpu * 730 * cpuHour + plan.totalMemoryGb * 730 * memoryHour;
-  const db = dbNeeded ? (scale.mau >= 100_000 ? 120 : scale.mau >= 10_000 ? 36 : 12) : 0;
-  const network = plan.bandwidthGb * 0.05;
-  const platform = 5;
-
-  const monthlyCost = round2(compute + db + network + platform);
+function railwayCost(
+  analysis: RepoAnalysis,
+  mau: number,
+  demand: ReturnType<typeof estimateDemand>
+): PlatformCost {
+  const compute = demand.requiredCpu * HOURS_PER_MONTH * 0.035;
+  const memory = demand.requiredMemoryGb * HOURS_PER_MONTH * 0.0042;
+  const serviceFee = 5;
+  const dbCost = analysis.resourceEstimate.hasPersistentDatabase
+    ? Math.max(15, 12 + mau * 0.0013)
+    : 6;
+  const bandwidth = Math.max(0, demand.outboundGb - 100) * 0.05;
+  const total = compute + memory + serviceFee + dbCost + bandwidth;
 
   return {
     platform: "Railway",
-    monthlyCost,
+    confidence: "medium",
+    totalUsd: roundUsd(total),
     lineItems: [
-      { name: "Runtime Usage", monthlyCost: round2(compute) },
-      { name: "Managed Database", monthlyCost: db },
-      { name: "Data Transfer", monthlyCost: round2(network) },
-      { name: "Base Plan", monthlyCost: platform }
+      {
+        label: "CPU usage",
+        amountUsd: roundUsd(compute),
+        detail: `${demand.requiredCpu.toFixed(2)} vCPU equivalent usage`
+      },
+      {
+        label: "Memory usage",
+        amountUsd: roundUsd(memory),
+        detail: `${demand.requiredMemoryGb.toFixed(2)} GB RAM equivalent usage`
+      },
+      {
+        label: "Platform + data services",
+        amountUsd: roundUsd(serviceFee + dbCost),
+        detail: analysis.resourceEstimate.hasPersistentDatabase
+          ? "Project fee + managed database"
+          : "Project fee + lightweight persistence"
+      },
+      {
+        label: "Bandwidth",
+        amountUsd: roundUsd(bandwidth),
+        detail: `${demand.outboundGb.toFixed(1)} GB outbound`
+      }
     ],
     assumptions: [
-      "Modeled as usage-based services with one primary region.",
-      "Plan credits, discounts, and idle scaling behavior are not included."
+      "No private network transfer charges",
+      "Single production service and optional worker",
+      "Metered usage averaged over the month"
     ]
   };
 }
 
-function estimateVercel(analysis: RepoAnalysis, plan: ResourcePlan, scale: TrafficScale): PlatformEstimate {
-  const base = 20;
-  const complexityMultiplier = analysis.heuristics.complexity === "high" ? 1.25 : analysis.heuristics.complexity === "medium" ? 1.1 : 1;
+function vercelCost(
+  analysis: RepoAnalysis,
+  mau: number,
+  demand: ReturnType<typeof estimateDemand>
+): PlatformCost {
+  const basePlan = 20;
+  const includedInvocations = 1_000_000;
+  const includedExecutionHours = 100;
 
-  const functionUnits = (scale.monthlyRequests / 1_000_000) * 14 * complexityMultiplier;
-  const functionCost = functionUnits;
-  const bandwidthIncludedGb = 100;
-  const bandwidthCost = Math.max(0, plan.bandwidthGb - bandwidthIncludedGb) * 0.12;
-  const dbAddOn = analysis.runtime.hasDatabaseDependency
-    ? scale.mau >= 100_000
-      ? 95
-      : scale.mau >= 10_000
-        ? 38
-        : 15
+  const monthlyInvocations = demand.monthlyRequests;
+  const invocationCost = Math.max(0, monthlyInvocations - includedInvocations) / 1_000_000 * 0.6;
+
+  const executionHours =
+    (monthlyInvocations * analysis.trafficProfile.averageCpuMsPerRequest) / 1000 / 60 / 60;
+  const executionCost = Math.max(0, executionHours - includedExecutionHours) * 0.2;
+
+  const bandwidth = Math.max(0, demand.outboundGb - 100) * 0.15;
+
+  const externalDataCost = analysis.resourceEstimate.hasPersistentDatabase
+    ? Math.max(16, 12 + mau * 0.0014)
     : 0;
 
-  const monthlyCost = round2(base + functionCost + bandwidthCost + dbAddOn);
+  const observability = 4 + Math.min(35, mau * 0.00015);
+  const total = basePlan + invocationCost + executionCost + bandwidth + externalDataCost + observability;
 
   return {
     platform: "Vercel",
-    monthlyCost,
+    confidence: "low",
+    totalUsd: roundUsd(total),
     lineItems: [
-      { name: "Pro Base", monthlyCost: base },
-      { name: "Compute + Edge Functions", monthlyCost: round2(functionCost) },
-      { name: "Bandwidth Overages", monthlyCost: round2(bandwidthCost) },
-      { name: "Managed Data Add-on", monthlyCost: dbAddOn }
+      {
+        label: "Pro plan baseline",
+        amountUsd: roundUsd(basePlan),
+        detail: "Team plan entry cost"
+      },
+      {
+        label: "Serverless overages",
+        amountUsd: roundUsd(invocationCost + executionCost),
+        detail: `${(monthlyInvocations / 1_000_000).toFixed(2)}M invocations and ${executionHours.toFixed(1)} execution hours`
+      },
+      {
+        label: "Bandwidth",
+        amountUsd: roundUsd(bandwidth),
+        detail: `${demand.outboundGb.toFixed(1)} GB outbound transfer`
+      },
+      {
+        label: "External data + monitoring",
+        amountUsd: roundUsd(externalDataCost + observability),
+        detail: analysis.resourceEstimate.hasPersistentDatabase
+          ? "Managed DB from a third-party provider plus log/analytics add-ons"
+          : "Log/analytics add-ons"
+      }
     ],
     assumptions: [
-      "Assumes one Pro seat and API-heavy serverless usage.",
-      "Includes external DB add-on only for apps that appear stateful."
+      "Route handlers/API traffic drives function usage",
+      "Static assets served by CDN where possible",
+      "Database costs are external to Vercel"
     ]
   };
 }
 
-function calculateScaleBreakdown(
-  analysis: RepoAnalysis,
-  scale: TrafficScale,
-  resourcePlan: ResourcePlan
-): ScaleCostBreakdown {
-  const dbNeeded = analysis.runtime.hasDatabaseDependency;
+export function calculateCostBreakdown(analysis: RepoAnalysis): ScaleCostBreakdown[] {
+  return MAU_SCALES.map((mau) => {
+    const demand = estimateDemand(analysis, mau);
 
-  const estimates = [
-    estimateAws(resourcePlan, scale, dbNeeded),
-    estimateFly(resourcePlan, scale, dbNeeded),
-    estimateRailway(resourcePlan, scale, dbNeeded),
-    estimateVercel(analysis, resourcePlan, scale)
-  ].sort((a, b) => a.monthlyCost - b.monthlyCost);
-
-  return {
-    scale,
-    resourcePlan,
-    estimates
-  };
-}
-
-export function calculateCostReport({ analysis, averageRequestsPerUser = 35, averageResponseKb = 220 }: CostInput): CostEstimationReport {
-  const scaleBreakdowns = SCALE_TARGETS.map(({ key, mau }) => {
-    const scale = buildTrafficScale(mau, key, averageRequestsPerUser, averageResponseKb);
-    const plan = buildResourcePlan(analysis, scale);
-    return calculateScaleBreakdown(analysis, scale, plan);
+    return {
+      mau,
+      monthlyRequests: Math.round(demand.monthlyRequests),
+      estimatedOutboundGb: roundUsd(demand.outboundGb),
+      platformCosts: [
+        awsCost(analysis, mau, demand),
+        flyCost(analysis, mau, demand),
+        railwayCost(analysis, mau, demand),
+        vercelCost(analysis, mau, demand)
+      ]
+    };
   });
-
-  return {
-    generatedAt: new Date().toISOString(),
-    analysisSummary: {
-      framework: analysis.runtime.framework,
-      complexity: analysis.heuristics.complexity,
-      packageJsonFound: analysis.packageJsonFound,
-      dockerfileFound: analysis.docker.found
-    },
-    scales: scaleBreakdowns,
-    caveats: [
-      "These are directional estimates, not cloud-provider invoices.",
-      "Burst traffic, background jobs, and global redundancy can materially change cost.",
-      "Always validate against provider calculators before committing procurement spend."
-    ]
-  };
 }

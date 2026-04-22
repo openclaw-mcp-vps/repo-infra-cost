@@ -1,53 +1,68 @@
-import { NextRequest, NextResponse } from "next/server";
-import { ACCESS_COOKIE, hasPaidCheckoutRef, recordLemonPurchase, verifyLemonSignature } from "@/lib/lemonsqueezy";
+import { NextResponse } from "next/server";
 
-function accessCookieOptions() {
-  return {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax" as const,
-    path: "/",
-    maxAge: 60 * 60 * 24 * 30
+import { addPurchaseRecord } from "@/lib/database";
+import { verifyStripeWebhookSignature } from "@/lib/lemonsqueezy";
+
+interface StripeWebhookEvent {
+  id: string;
+  type: string;
+  data: {
+    object: {
+      id?: string;
+      customer_email?: string;
+      customer_details?: {
+        email?: string;
+      };
+      metadata?: Record<string, string | undefined>;
+    };
   };
 }
 
-export async function GET(request: NextRequest) {
-  const checkoutRef = request.nextUrl.searchParams.get("checkoutRef");
+export async function POST(req: Request) {
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-  if (!checkoutRef) {
-    return NextResponse.json({ granted: false, reason: "Missing checkoutRef." }, { status: 400 });
+  if (!webhookSecret) {
+    return NextResponse.json(
+      { error: "Missing STRIPE_WEBHOOK_SECRET. Webhook cannot be verified." },
+      { status: 500 }
+    );
   }
 
-  const granted = await hasPaidCheckoutRef(checkoutRef);
-  const response = NextResponse.json({ granted });
+  const rawBody = await req.text();
+  const signature = req.headers.get("stripe-signature");
 
-  if (granted) {
-    response.cookies.set(ACCESS_COOKIE, "granted", accessCookieOptions());
-    response.cookies.set("ric_checkout_ref", "", {
-      ...accessCookieOptions(),
-      maxAge: 0,
-      httpOnly: false
+  if (!signature) {
+    return NextResponse.json({ error: "Missing stripe-signature header." }, { status: 400 });
+  }
+
+  const valid = verifyStripeWebhookSignature(rawBody, signature, webhookSecret);
+  if (!valid) {
+    return NextResponse.json({ error: "Invalid webhook signature." }, { status: 400 });
+  }
+
+  let event: StripeWebhookEvent;
+  try {
+    event = JSON.parse(rawBody) as StripeWebhookEvent;
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const object = event.data.object;
+    const email =
+      object.customer_details?.email || object.customer_email || object.metadata?.email || null;
+
+    if (!email) {
+      return NextResponse.json({ error: "Checkout session is missing customer email." }, { status: 400 });
+    }
+
+    await addPurchaseRecord({
+      email,
+      sessionId: object.id || event.id,
+      purchasedAt: new Date().toISOString(),
+      source: "stripe_webhook"
     });
   }
 
-  return response;
-}
-
-export async function POST(request: NextRequest) {
-  const rawBody = await request.text();
-  const signature = request.headers.get("x-signature");
-  const secretConfigured = Boolean(process.env.LEMON_SQUEEZY_WEBHOOK_SECRET);
-
-  if (secretConfigured && !verifyLemonSignature(rawBody, signature)) {
-    return NextResponse.json({ error: "Invalid webhook signature." }, { status: 401 });
-  }
-
-  try {
-    const payload = JSON.parse(rawBody) as unknown;
-    const record = await recordLemonPurchase(payload as Parameters<typeof recordLemonPurchase>[0]);
-
-    return NextResponse.json({ ok: true, recorded: Boolean(record) });
-  } catch {
-    return NextResponse.json({ error: "Malformed JSON payload." }, { status: 400 });
-  }
+  return NextResponse.json({ received: true });
 }

@@ -1,101 +1,86 @@
-export type Complexity = "low" | "medium" | "high";
-export type ScaleKey = "1k" | "10k" | "100k";
+export type HostingPlatform = "AWS" | "Fly.io" | "Railway" | "Vercel";
 
-export interface ParsedRepository {
-  owner: string;
-  repo: string;
-  defaultBranch: string;
-  repoUrl: string;
+export interface TrafficProfile {
+  requestsPerUserPerMonth: number;
+  averageResponseKb: number;
+  averageCpuMsPerRequest: number;
 }
 
-export interface DockerAnalysis {
-  found: boolean;
-  filePath?: string;
-  baseImage?: string;
-  multiStage: boolean;
-  exposedPorts: number[];
-}
-
-export interface RuntimeSignals {
-  framework: string;
-  packageManager: string;
-  nodeVersion: string | null;
-  hasDatabaseDependency: boolean;
-  buildCommand: string;
-  startCommand: string;
-}
-
-export interface ResourceHeuristics {
-  cpuBaseline: number;
-  memoryMb: number;
-  diskGb: number;
-  buildMinutes: number;
-  bandwidthGbPerMau: number;
-  complexity: Complexity;
+export interface ResourceEstimate {
+  baselineCpuCores: number;
+  baselineMemoryMb: number;
+  storageGb: number;
+  hasBackgroundWorkers: boolean;
+  hasPersistentDatabase: boolean;
+  runtime: "node" | "python" | "unknown";
 }
 
 export interface RepoAnalysis {
-  parsedRepository: ParsedRepository;
+  repoUrl: string;
+  owner: string;
+  repo: string;
+  defaultBranch: string;
+  stars: number;
   packageJsonFound: boolean;
-  packageJsonPath?: string;
-  docker: DockerAnalysis;
-  runtime: RuntimeSignals;
-  dependencyCounts: {
-    dependencies: number;
-    devDependencies: number;
-    total: number;
-  };
-  topDependencies: string[];
-  scripts: string[];
-  heuristics: ResourceHeuristics;
-  warnings: string[];
+  dockerfileFound: boolean;
+  frameworks: string[];
+  packageManager: "npm" | "pnpm" | "yarn" | "unknown";
+  dependencies: string[];
+  trafficProfile: TrafficProfile;
+  resourceEstimate: ResourceEstimate;
+  notes: string[];
 }
 
-export interface TrafficScale {
-  key: ScaleKey;
-  mau: number;
-  monthlyRequests: number;
-  averageResponseKb: number;
-  peakRps: number;
+export interface CostLineItem {
+  label: string;
+  amountUsd: number;
+  detail: string;
 }
 
-export interface ResourcePlan {
-  appInstances: number;
-  vcpuPerInstance: number;
-  memoryGbPerInstance: number;
-  totalVcpu: number;
-  totalMemoryGb: number;
-  bandwidthGb: number;
-  buildMinutes: number;
-}
-
-export interface PlatformLineItem {
-  name: string;
-  monthlyCost: number;
-  notes?: string;
-}
-
-export interface PlatformEstimate {
-  platform: "AWS" | "Fly.io" | "Railway" | "Vercel";
-  monthlyCost: number;
-  lineItems: PlatformLineItem[];
+export interface PlatformCost {
+  platform: HostingPlatform;
+  totalUsd: number;
+  confidence: "low" | "medium" | "high";
+  lineItems: CostLineItem[];
   assumptions: string[];
 }
 
 export interface ScaleCostBreakdown {
-  scale: TrafficScale;
-  resourcePlan: ResourcePlan;
-  estimates: PlatformEstimate[];
+  mau: 1000 | 10000 | 100000;
+  monthlyRequests: number;
+  estimatedOutboundGb: number;
+  platformCosts: PlatformCost[];
 }
 
-export interface CostEstimationReport {
-  generatedAt: string;
-  analysisSummary: {
-    framework: string;
-    complexity: Complexity;
-    packageJsonFound: boolean;
-    dockerfileFound: boolean;
-  };
+export interface EstimateResult {
+  id: string;
+  createdAt: string;
+  analysis: RepoAnalysis;
   scales: ScaleCostBreakdown[];
-  caveats: string[];
+}
+
+export interface AnalyzeRequest {
+  repoUrl: string;
+  requestsPerUserPerMonth?: number;
+  averageResponseKb?: number;
+  averageCpuMsPerRequest?: number;
+}
+
+export interface PurchaseRecord {
+  email: string;
+  sessionId: string;
+  purchasedAt: string;
+  source: "stripe_webhook" | "manual";
+}
+
+export interface StoredEstimate {
+  id: string;
+  createdAt: string;
+  analysis: RepoAnalysis;
+  scales: ScaleCostBreakdown[];
+}
+
+export interface DatabaseSchema {
+  purchases: PurchaseRecord[];
+  estimates: StoredEstimate[];
 }

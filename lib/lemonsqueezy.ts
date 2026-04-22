@@ -1,164 +1,111 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
+import crypto from "node:crypto";
 
-const PURCHASES_FILE = path.join(process.cwd(), "data", "purchases.json");
-export const ACCESS_COOKIE = "ric_access";
+const ACCESS_TOKEN_VERSION = "v1";
+export const ACCESS_COOKIE_NAME = "repo_infra_cost_access";
+const ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
 
-export interface PurchaseRecord {
-  orderId: string;
-  email: string | null;
-  checkoutRef: string | null;
-  eventName: string;
-  paidAt: string;
+interface AccessPayload {
+  v: string;
+  email: string;
+  exp: number;
 }
 
-interface LemonWebhookPayload {
-  meta?: {
-    event_name?: string;
-    custom_data?: {
-      checkout_ref?: string;
-      email_hint?: string;
-    };
-  };
-  data?: {
-    id?: string;
-    attributes?: {
-      identifier?: string;
-      order_number?: number;
-      user_email?: string;
-      customer_email?: string;
-      status?: string;
-    };
-  };
+function getSigningSecret() {
+  return process.env.STRIPE_WEBHOOK_SECRET || "dev-only-secret";
 }
 
-async function ensurePurchasesFile() {
-  await mkdir(path.dirname(PURCHASES_FILE), { recursive: true });
-
-  try {
-    await readFile(PURCHASES_FILE, "utf8");
-  } catch {
-    await writeFile(PURCHASES_FILE, "[]", "utf8");
-  }
+function base64UrlEncode(data: string) {
+  return Buffer.from(data).toString("base64url");
 }
 
-async function readPurchases(): Promise<PurchaseRecord[]> {
-  await ensurePurchasesFile();
-  const content = await readFile(PURCHASES_FILE, "utf8");
-
-  try {
-    const parsed = JSON.parse(content) as PurchaseRecord[];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+function base64UrlDecode(data: string) {
+  return Buffer.from(data, "base64url").toString("utf8");
 }
 
-async function writePurchases(records: PurchaseRecord[]) {
-  await ensurePurchasesFile();
-  await writeFile(PURCHASES_FILE, JSON.stringify(records, null, 2), "utf8");
+function sign(payload: string) {
+  return crypto.createHmac("sha256", getSigningSecret()).update(payload).digest("base64url");
 }
 
-function extractOrderId(payload: LemonWebhookPayload): string {
-  const attributes = payload.data?.attributes;
-
-  if (typeof attributes?.identifier === "string" && attributes.identifier.length > 0) {
-    return attributes.identifier;
-  }
-
-  if (typeof attributes?.order_number === "number") {
-    return String(attributes.order_number);
-  }
-
-  if (typeof payload.data?.id === "string" && payload.data.id.length > 0) {
-    return payload.data.id;
-  }
-
-  return "unknown-order";
-}
-
-function extractEmail(payload: LemonWebhookPayload): string | null {
-  const attributes = payload.data?.attributes;
-  return attributes?.user_email ?? attributes?.customer_email ?? payload.meta?.custom_data?.email_hint ?? null;
-}
-
-export function verifyLemonSignature(rawBody: string, providedSignature: string | null): boolean {
-  const secret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
-  if (!secret || !providedSignature) return false;
-
-  const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
-
-  try {
-    const expectedBuffer = Buffer.from(expected, "utf8");
-    const providedBuffer = Buffer.from(providedSignature, "utf8");
-    return expectedBuffer.length === providedBuffer.length && timingSafeEqual(expectedBuffer, providedBuffer);
-  } catch {
+function secureCompare(a: string, b: string) {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  if (left.length !== right.length) {
     return false;
   }
+  return crypto.timingSafeEqual(left, right);
 }
 
-export function getCheckoutBaseUrl(): string | null {
-  const productId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID;
-
-  if (!productId) {
-    return null;
-  }
-
-  if (productId.startsWith("http://") || productId.startsWith("https://")) {
-    return productId;
-  }
-
-  return `https://checkout.lemonsqueezy.com/buy/${productId}`;
-}
-
-export function buildCheckoutUrl(checkoutRef: string, email?: string): string | null {
-  const baseUrl = getCheckoutBaseUrl();
-  if (!baseUrl) return null;
-
-  const url = new URL(baseUrl);
-  url.searchParams.set("checkout[custom][checkout_ref]", checkoutRef);
-  url.searchParams.set("checkout[custom][source]", "repo-infra-cost");
-
-  if (email) {
-    url.searchParams.set("checkout[email]", email);
-    url.searchParams.set("checkout[custom][email_hint]", email);
-  }
-
-  return url.toString();
-}
-
-export async function recordLemonPurchase(payload: LemonWebhookPayload): Promise<PurchaseRecord | null> {
-  const eventName = payload.meta?.event_name ?? "unknown";
-
-  if (!eventName.includes("order") && !eventName.includes("subscription")) {
-    return null;
-  }
-
-  const status = payload.data?.attributes?.status?.toLowerCase();
-  if (status && !["paid", "active", "completed"].some((flag) => status.includes(flag))) {
-    return null;
-  }
-
-  const record: PurchaseRecord = {
-    orderId: extractOrderId(payload),
-    email: extractEmail(payload),
-    checkoutRef: payload.meta?.custom_data?.checkout_ref ?? null,
-    eventName,
-    paidAt: new Date().toISOString()
+export function createAccessToken(email: string) {
+  const payload: AccessPayload = {
+    v: ACCESS_TOKEN_VERSION,
+    email: email.trim().toLowerCase(),
+    exp: Math.floor(Date.now() / 1000) + ACCESS_TOKEN_TTL_SECONDS
   };
 
-  const purchases = await readPurchases();
-  const dedupe = purchases.filter((item) => item.orderId !== record.orderId);
-  dedupe.unshift(record);
-  await writePurchases(dedupe.slice(0, 2000));
-
-  return record;
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const signature = sign(encodedPayload);
+  return `${encodedPayload}.${signature}`;
 }
 
-export async function hasPaidCheckoutRef(checkoutRef: string): Promise<boolean> {
-  if (!checkoutRef) return false;
+export function verifyAccessToken(token?: string | null) {
+  if (!token) {
+    return { valid: false as const };
+  }
 
-  const purchases = await readPurchases();
-  return purchases.some((item) => item.checkoutRef === checkoutRef);
+  const [payloadPart, signaturePart] = token.split(".");
+
+  if (!payloadPart || !signaturePart) {
+    return { valid: false as const };
+  }
+
+  const expectedSignature = sign(payloadPart);
+  const isSignatureMatch = secureCompare(signaturePart, expectedSignature);
+
+  if (!isSignatureMatch) {
+    return { valid: false as const };
+  }
+
+  try {
+    const payload = JSON.parse(base64UrlDecode(payloadPart)) as AccessPayload;
+    const now = Math.floor(Date.now() / 1000);
+
+    if (payload.v !== ACCESS_TOKEN_VERSION || payload.exp < now) {
+      return { valid: false as const };
+    }
+
+    return {
+      valid: true as const,
+      email: payload.email,
+      expiresAt: payload.exp
+    };
+  } catch {
+    return { valid: false as const };
+  }
+}
+
+export function getStripePaymentLink() {
+  return process.env.NEXT_PUBLIC_STRIPE_PAYMENT_LINK as string;
+}
+
+export function verifyStripeWebhookSignature(rawBody: string, signatureHeader: string, secret: string) {
+  const components = signatureHeader.split(",").map((part) => part.trim().split("="));
+  const values = new Map<string, string>();
+
+  for (const [key, value] of components) {
+    if (key && value) {
+      values.set(key, value);
+    }
+  }
+
+  const timestamp = values.get("t");
+  const signature = values.get("v1");
+
+  if (!timestamp || !signature) {
+    return false;
+  }
+
+  const payload = `${timestamp}.${rawBody}`;
+  const expected = crypto.createHmac("sha256", secret).update(payload, "utf8").digest("hex");
+
+  return secureCompare(signature, expected);
 }

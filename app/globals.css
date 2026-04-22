@@ -1,35 +1,42 @@
 @import "tailwindcss";
+@plugin "@tailwindcss/forms";
 
 :root {
   --background: #0d1117;
-  --surface: #111827;
-  --surface-alt: #0f172a;
-  --border: #1f2937;
-  --text: #e5e7eb;
-  --muted: #9ca3af;
-  --accent: #22c55e;
-  --accent-soft: rgba(34, 197, 94, 0.12);
-}
-
-* {
-  box-sizing: border-box;
-  border-color: var(--border);
+  --panel: #111827;
+  --panel-2: #1f2937;
+  --border: #263244;
+  --text: #e6edf3;
+  --muted: #94a3b8;
+  --accent: #22d3ee;
+  --accent-2: #34d399;
 }
 
 html,
 body {
-  margin: 0;
-  min-height: 100%;
-  background: radial-gradient(circle at 20% -20%, #1f2937 0%, #0d1117 40%), var(--background);
+  background: radial-gradient(circle at 10% 0%, #132032 0%, #0d1117 45%, #0d1117 100%);
   color: var(--text);
-  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
 }
 
-a {
-  color: inherit;
-  text-decoration: none;
+body {
+  font-family: var(--font-display), sans-serif;
 }
 
-::selection {
-  background: rgba(34, 197, 94, 0.3);
+code,
+pre,
+.font-mono {
+  font-family: var(--font-mono), monospace;
+}
+
+.section-grid {
+  background-image:
+    linear-gradient(rgba(34, 211, 238, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34, 211, 238, 0.06) 1px, transparent 1px);
+  background-size: 30px 30px;
+}
+
+.card-shadow {
+  box-shadow:
+    0 0 0 1px rgba(148, 163, 184, 0.1),
+    0 20px 40px -28px rgba(34, 211, 238, 0.35);
 }
